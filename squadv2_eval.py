@@ -49,7 +49,7 @@ class SelfRAGSquadEvaluator:
         
         print("Initializing BertScore...")
         self.bert_scorer = BERTScorer(
-            model_type='microsoft/deberta-xlarge-mnli',
+            model_type='roberta-large',
             lang='en',
             rescale_with_baseline=True,
             device=device
