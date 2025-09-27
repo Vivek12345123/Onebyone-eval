@@ -1,0 +1,12 @@
+{
+  "num_samples": 2000,
+  "strict_em": 0.1065,
+  "strict_f1": 0.21086711950124193,
+  "balanced_em": 0.1185,
+  "balanced_f1": 0.45891516940159505,
+  "balanced_precision": 0.4507390256773561,
+  "balanced_recall": 0.5198526652266636,
+  "bertscore_precision": 0.2651948918402195,
+  "bertscore_recall": 0.2730187388975173,
+  "bertscore_f1": 0.267964901253581
+}
