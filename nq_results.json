@@ -1,0 +1,14 @@
+{
+  "num_samples": 100,
+  "traditional_f1": 0.5156666666666666,
+  "traditional_em": 0.5,
+  "balanced_f1": 0.5397414374334535,
+  "balanced_em": 0.5,
+  "balanced_precision": 0.5403956830206831,
+  "balanced_recall": 0.5413470710803392,
+  "bertscore_precision": 0.35129958391189575,
+  "bertscore_recall": 0.36362290382385254,
+  "bertscore_f1": 0.356738805770874,
+  "bertscore_model": "roberta-large",
+  "bertscore_rescale_with_baseline": false
+}

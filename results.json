@@ -1,0 +1,18 @@
+{
+  "num_samples": 20,
+  "traditional_f1": 0.3,
+  "traditional_em": 0.3,
+  "balanced_f1": 0.023199531584059775,
+  "balanced_em": 0.3,
+  "balanced_precision": 0.027880818012396957,
+  "balanced_recall": 0.025940040523631858,
+  "bertscore_precision": 0.12229063361883163,
+  "bertscore_recall": 0.11795133352279663,
+  "bertscore_f1": 0.11999762058258057,
+  "bertscore_model": "roberta-large",
+  "bertscore_rescale_with_baseline": false,
+  "semantic_sample_precision": -1.8891957744956016,
+  "semantic_sample_recall": -1.9033035634085536,
+  "semantic_sample_f1": -1.8917899429798126,
+  "semantic_sample_size": 20
+}
