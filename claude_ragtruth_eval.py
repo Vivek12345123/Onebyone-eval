@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-ragtruth_eval.py - Fixed for Self-RAG text generation evaluation
+ragtruth_eval.py - Fixed for Self-RAG text generation vs hallucination detection
 
-- Uses Self-RAG HF repo id ("selfrag/selfrag_llama2_7b") for all tokenizer/model loads.
-- Supports evaluating an existing predictions JSONL OR generating predictions
-- For text generation mode: compares generated text with reference response
-- Skips span-level metrics when doing text generation (not hallucination detection)
+This script handles BOTH:
+1. Hallucination detection evaluation (span-level metrics) - when output is a list of spans
+2. Text generation evaluation (text comparison metrics) - when output is generated text
+
+For Self-RAG (text generation), it will use text comparison metrics.
 """
 
 import argparse
@@ -19,12 +20,110 @@ import collections
 from typing import Any, Dict, List, Tuple
 
 from bert_score import score as bert_score
+from difflib import SequenceMatcher
 
 # ----------------------------------------
-# Text comparison metrics
+# Span-based metrics (for hallucination detection)
+# ----------------------------------------
+def compute_multi_spans(gold_spans: List[Tuple[int,int]], pred_spans: List[Tuple[int,int]]):
+    """Compute overlap for multiple spans."""
+    if not gold_spans:
+        gold_sets = [set()]
+    else:
+        gold_sets = [set(range(int(start), int(end))) for start, end in gold_spans]
+    if not pred_spans:
+        pred_sets = [set()]
+    else:
+        pred_sets = [set(range(int(start), int(end))) for start, end in pred_spans]
+
+    try:
+        gold_union = set.union(*gold_sets) if gold_sets else set()
+    except TypeError:
+        gold_union = set()
+    try:
+        pred_union = set.union(*pred_sets) if pred_sets else set()
+    except TypeError:
+        pred_union = set()
+
+    tp = len(gold_union.intersection(pred_union))
+    pred_len = len(pred_union)
+    gold_len = len(gold_union)
+    return tp, pred_len, gold_len
+
+def find_start_end_index(text: str, sub_str: str, strict: bool = False) -> Tuple[int,int]:
+    """Find (start,end) indexes for sub_str inside text."""
+    if text is None:
+        return (-1, -1)
+    s = text.lower()
+    sub = sub_str.lower().strip()
+    start = s.find(sub)
+    if start == -1:
+        if len(sub) >= 10 and not strict:
+            match_length = 10
+            prefix_match = s.find(sub[:match_length])
+            suffix_match = s.find(sub[-match_length:])
+            if prefix_match != -1 and suffix_match != -1:
+                new_start = prefix_match
+                new_end = suffix_match + match_length
+                if 0.7 < (new_end - new_start) / max(1, len(sub)) < 1.3:
+                    return (new_start, new_end)
+            sub2 = ' '.join(sub.split())
+            start = s.find(sub2)
+            if start == -1:
+                return (-1, -1)
+    end = start + len(sub)
+    return (start, end)
+
+def cal_span_metrics(response: str, labels: List[Dict], output: str):
+    """Calculate span-level metrics for hallucination detection."""
+    try:
+        output_list = literal_eval(output)
+        if not isinstance(output_list, (list, tuple)):
+            output_list = []
+    except Exception:
+        output_list = []
+
+    predict_span = []
+    for out in output_list:
+        if not isinstance(out, str):
+            out = str(out)
+        tup = find_start_end_index(response or "", out, strict=False)
+        if tup != (-1, -1):
+            predict_span.append(tup)
+
+    ground_truth_span = []
+    if labels:
+        for label in labels:
+            try:
+                ground_truth_span.append((int(label['start']), int(label['end'])))
+            except Exception:
+                continue
+
+    if len(predict_span) == 0:
+        predict_span.append((0,0))
+    if len(ground_truth_span) == 0:
+        ground_truth_span.append((0,0))
+
+    match_size, prediction, groud_truth = compute_multi_spans(ground_truth_span, predict_span)
+
+    # case level
+    pos_true_cnt = neg_true_cnt = neg_false_cnt = pos_false_cnt = 0
+    if output_list != [] and labels != []:
+        pos_true_cnt += 1
+    elif output_list == [] and labels != []:
+        neg_true_cnt += 1
+    elif output_list == [] and labels == []:
+        neg_false_cnt += 1
+    elif output_list != [] and labels == []:
+        pos_false_cnt += 1
+
+    return match_size, prediction, groud_truth, pos_true_cnt, neg_true_cnt, neg_false_cnt, pos_false_cnt
+
+# ----------------------------------------
+# Text comparison metrics (for text generation)
 # ----------------------------------------
 def normalize_answer(s: str) -> str:
-    """Standard normalization for F1/EM calculation."""
+    """Standard normalization for text comparison."""
     def remove_articles(text):
         return re.sub(r'\b(a|an|the)\b', ' ', text)
     def white_space_fix(text):
@@ -61,92 +160,144 @@ def exact_match_score(prediction: str, ground_truth: str) -> float:
     """Calculate exact match score."""
     return float(normalize_answer(prediction) == normalize_answer(ground_truth))
 
-def token_similarity(a: str, b: str) -> float:
-    """Return similarity 0–1 between two tokens."""
-    from difflib import SequenceMatcher
-    return SequenceMatcher(None, a, b).ratio()
-
+# --------------------------
+# Reworked balanced metrics
+# --------------------------
 def normalize_balanced(s: str) -> str:
-    """Balanced normalization with minimal suffix stripping."""
+    """
+    Conservative normalization for balanced metrics:
+    - Use same base normalization as normalize_answer
+    - Light stemming only for longer words (very conservative)
+    """
     s = normalize_answer(s)
     tokens = []
     for t in s.split():
-        if t.endswith("ing") and len(t) > 4:
-            t = t[:-3]
-        elif t.endswith("ed") and len(t) > 3:
-            t = t[:-2]
-        elif t.endswith("ly") and len(t) > 4:
-            t = t[:-2]
-        elif t.endswith("s") and len(t) > 3 and not t.endswith("ss"):
-            t = t[:-1]
+        # conservative stemming for longer tokens only
+        if len(t) > 6:
+            if t.endswith("ing") and len(t) > 7:
+                t = t[:-3]
+            elif t.endswith("ed") and len(t) > 6:
+                t = t[:-2]
         tokens.append(t)
     return " ".join(tokens)
 
-def numeric_overlap(pred: str, gold: str) -> bool:
-    """Returns True if numeric tokens overlap."""
-    nums_pred = set(re.findall(r"\d+", pred))
-    nums_gold = set(re.findall(r"\d+", gold))
-    return len(nums_pred & nums_gold) > 0
+def token_similarity(a: str, b: str) -> float:
+    """Token-level similarity [0..1] using SequenceMatcher."""
+    return SequenceMatcher(None, a, b).ratio()
 
 def balanced_f1(pred: str, gold: str) -> Tuple[float, float, float]:
-    """Balanced F1 with soft token similarity."""
+    """
+    Balanced F1 with proportional soft matching:
+    Returns (f1, precision, recall).
+    Conservative thresholds provide partial credit for near-matches.
+    """
     pred_tokens = normalize_balanced(pred).split()
     gold_tokens = normalize_balanced(gold).split()
     
     if not gold_tokens:
-        return (1.0, 1.0, 1.0) if not pred_tokens else (0.0, 0.0, 0.0)
+        if not pred_tokens:
+            return (1.0, 1.0, 1.0)
+        else:
+            return (0.0, 0.0, 0.0)
     if not pred_tokens:
         return (0.0, 0.0, 0.0)
-    
-    # Check numeric overlap
-    if numeric_overlap(pred, gold):
-        return (1.0, 1.0, 1.0)
-    
-    # Soft recall: for each gold token, find best match in pred
+
+    # Tunable thresholds for conservative partial credit
+    HIGH = 0.85
+    MID = 0.70
+
+    # Recall: how well gold tokens are covered by pred tokens
     total_rec = 0.0
     for gt in gold_tokens:
-        best = max((token_similarity(pt, gt) for pt in pred_tokens), default=0.0)
-        total_rec += best
-    rec = total_rec / len(gold_tokens) if gold_tokens else 0.0
-    
-    # Soft precision: for each pred token, find best match in gold
+        best = 0.0
+        for pt in pred_tokens:
+            sim = token_similarity(gt, pt)
+            if sim > best:
+                best = sim
+        if best >= HIGH:
+            total_rec += best
+        elif best >= MID:
+            total_rec += best * 0.6
+        # below MID: no credit
+
+    rec = total_rec / len(gold_tokens)
+
+    # Precision: how many pred tokens are correct w.r.t gold tokens
     total_prec = 0.0
     for pt in pred_tokens:
-        best = max((token_similarity(gt, pt) for gt in gold_tokens), default=0.0)
-        total_prec += best
-    prec = total_prec / len(pred_tokens) if pred_tokens else 0.0
-    
+        best = 0.0
+        for gt in gold_tokens:
+            sim = token_similarity(pt, gt)
+            if sim > best:
+                best = sim
+        if best >= HIGH:
+            total_prec += best
+        elif best >= MID:
+            total_prec += best * 0.6
+
+    prec = total_prec / len(pred_tokens)
+
     f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
     return f1, prec, rec
 
-def balanced_em(pred: str, gold: str) -> int:
-    """Balanced EM with numeric overlap consideration."""
+def balanced_em(pred: str, gold: str) -> float:
+    """
+    Conservative balanced exact match:
+    - Return 1.0 if normalized strings equal
+    - Else compute average best-token similarity and Jaccard; only count as EM if extremely high
+    """
     pred_norm = normalize_balanced(pred)
     gold_norm = normalize_balanced(gold)
-    if numeric_overlap(pred, gold):
-        return 1
-    return int(pred_norm == gold_norm)
+    
+    if pred_norm == gold_norm:
+        return 1.0
+    
+    pred_tokens = pred_norm.split()
+    gold_tokens = gold_norm.split()
+
+    if not gold_tokens:
+        return 1.0 if not pred_tokens else 0.0
+    if not pred_tokens:
+        return 0.0
+
+    # average best similarity from gold->pred
+    sum_best = 0.0
+    for gt in gold_tokens:
+        best = max((token_similarity(gt, pt) for pt in pred_tokens), default=0.0)
+        sum_best += best
+    avg_sim = sum_best / len(gold_tokens)
+
+    # jaccard similarity
+    intersection = len(set(pred_tokens) & set(gold_tokens))
+    union = len(set(pred_tokens) | set(gold_tokens))
+    jaccard = intersection / union if union > 0 else 0.0
+
+    # Decision thresholds (conservative)
+    if avg_sim >= 0.90 or jaccard >= 0.90:
+        return 1.0
+    return 0.0
 
 # ----------------------------------------
-# Helpers: load dataset or predictions file
+# Detection of task type
 # ----------------------------------------
-def load_predictions_from_jsonl(filepath: str) -> List[Dict[str,Any]]:
-    """Load a JSONL predictions file."""
-    data = []
-    with open(filepath, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                data.append(json.loads(line))
-            except Exception as e:
-                print(f"Warning: Failed to parse line: {e}")
-                continue
-    return data
+def detect_task_type(output: str) -> str:
+    """Detect whether output is for hallucination detection or text generation."""
+    if not output or output.strip() == "":
+        return "empty"
+    
+    # Try to parse as list (hallucination detection)
+    try:
+        parsed = literal_eval(output)
+        if isinstance(parsed, (list, tuple)):
+            return "hallucination_detection"
+    except Exception:
+        pass
+    
+    # Otherwise it's text generation
+    return "text_generation"
 
 # ----------------------------------------
-# Optional generation from Self-RAG
+# Self-RAG generation
 # ----------------------------------------
 SELF_RAG_REPO = "selfrag/selfrag_llama2_7b"
 
@@ -156,11 +307,6 @@ def _prepare_tokenizer(model_source: str):
     tokenizer.padding_side = "left"
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    if getattr(tokenizer, "pad_token_id", None) is None:
-        try:
-            tokenizer.pad_token_id = tokenizer.eos_token_id
-        except Exception:
-            pass
     return tokenizer
 
 def generate_predictions_on_dataset(dataset, batch_size:int, max_tokens:int, model_source: str = SELF_RAG_REPO):
@@ -169,99 +315,70 @@ def generate_predictions_on_dataset(dataset, batch_size:int, max_tokens:int, mod
     from transformers import AutoModelForCausalLM
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"[generate] Loading tokenizer+model from {model_source} on device {device} ...")
+    print(f"[generate] Loading model from {model_source} on {device}...")
     tokenizer = _prepare_tokenizer(model_source)
     model = AutoModelForCausalLM.from_pretrained(
         model_source,
         device_map="auto" if device == "cuda" else None,
         torch_dtype=torch.float16 if device == "cuda" else torch.float32
     )
-    try:
-        model.to(device)
-    except Exception:
-        pass
     model.eval()
 
     out_list = []
     with torch.no_grad():
         total = len(dataset)
-        batch_prompts = []
-        batch_idxs = []
-        
-        for i, raw_ex in enumerate(dataset):
-            # Get the prompt/question from the dataset
-            if isinstance(raw_ex, dict):
-                ex = dict(raw_ex)
-            elif hasattr(raw_ex, "to_dict"):
-                try:
-                    ex = dict(raw_ex.to_dict())
-                except Exception:
+        for i in range(0, total, batch_size):
+            batch = dataset[i:min(i+batch_size, total)]
+            prompts = []
+            
+            for raw_ex in batch:
+                if isinstance(raw_ex, dict):
+                    ex = dict(raw_ex)
+                else:
                     ex = {"prompt": str(raw_ex)}
-            else:
-                ex = {"prompt": str(raw_ex)}
+                
+                prompt_text = ex.get("prompt") or ex.get("question") or ""
+                prompt = f"### Instruction: {prompt_text}\n\n### Response:"
+                prompts.append(prompt)
             
-            # Extract prompt text
-            prompt_text = ex.get("prompt") or ex.get("question") or ex.get("input") or ""
+            enc = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=max_tokens)
+            input_ids = enc["input_ids"].to(device)
+            attention_mask = enc["attention_mask"].to(device)
             
-            # Create Self-RAG style prompt
-            prompt = f"### Instruction: {prompt_text}\n\n### Response:"
+            generated = model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=256,
+                do_sample=False,
+                pad_token_id=tokenizer.pad_token_id
+            )
             
-            batch_prompts.append(prompt)
-            batch_idxs.append(i)
+            decoded = tokenizer.batch_decode(generated, skip_special_tokens=True)
             
-            if len(batch_prompts) >= batch_size or (i + 1) == total:
-                enc = tokenizer(batch_prompts, return_tensors="pt", padding=True, truncation=True, max_length=max_tokens)
-                input_ids = enc["input_ids"].to(device)
-                attention_mask = enc["attention_mask"].to(device)
-                
-                generated = model.generate(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    max_new_tokens=min(max_tokens, 256),
-                    do_sample=False,
-                    num_beams=1,
-                    pad_token_id=tokenizer.pad_token_id,
-                    eos_token_id=tokenizer.eos_token_id
-                )
-                
-                decoded = tokenizer.batch_decode(generated, skip_special_tokens=True)
-                
-                for dec, prompt, idx in zip(decoded, batch_prompts, batch_idxs):
-                    # Extract the generated response
-                    ans = ""
-                    if "### Response:" in dec:
-                        ans = dec.split("### Response:", 1)[-1].strip()
-                    elif prompt in dec:
-                        ans = dec.replace(prompt, "").strip()
-                    else:
-                        ans = dec.strip()
-                    
-                    # Get original example
-                    orig = dataset[idx]
-                    if isinstance(orig, dict):
-                        exrec = dict(orig)
-                    elif hasattr(orig, "to_dict"):
-                        try:
-                            exrec = dict(orig.to_dict())
-                        except Exception:
-                            exrec = {}
-                    else:
-                        exrec = {}
-                    
-                    entry = {
-                        "response": exrec.get("response", ""),  # Reference response
-                        "labels": exrec.get("labels", []),      # Hallucination labels (not used for text gen)
-                        "task_type": exrec.get("task_type", exrec.get("task", "")),
-                        "output": ans,  # Generated text
-                        "prompt": prompt_text  # Original prompt
-                    }
-                    out_list.append(entry)
-                
-                batch_prompts = []
-                batch_idxs = []
-                
-                if (i+1) % 100 == 0:
-                    print(f"[generate] Generated for {i+1}/{total}")
+            for j, (dec, prompt) in enumerate(zip(decoded, prompts)):
+                idx = i + j
+                if idx >= total:
+                    break
+                ans = ""
+                if "### Response:" in dec:
+                    ans = dec.split("### Response:", 1)[-1].strip()
+                else:
+                    ans = dec.replace(prompt, "").strip()
+                orig = dataset[idx]
+                if isinstance(orig, dict):
+                    exrec = dict(orig)
+                else:
+                    exrec = {}
+                entry = {
+                    "response": exrec.get("response", ""),
+                    "labels": exrec.get("labels", []),
+                    "task_type": exrec.get("task_type", ""),
+                    "output": ans
+                }
+                out_list.append(entry)
+            
+            if (i + batch_size) % 100 == 0:
+                print(f"[generate] Processed {min(i+batch_size, total)}/{total}")
     
     return out_list
 
@@ -270,172 +387,195 @@ def generate_predictions_on_dataset(dataset, batch_size:int, max_tokens:int, mod
 # ----------------------------------------
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--filepath', type=str, default=None,
-                        help='Path to predictions JSONL file.')
-    parser.add_argument('--generate', action='store_true',
-                        help='Generate predictions from Self-RAG on the HF test split.')
-    parser.add_argument('--model_source', type=str, default=SELF_RAG_REPO,
-                        help='HF repo id or local path for Self-RAG model/tokenizer.')
+    parser.add_argument('--filepath', type=str, default=None)
+    parser.add_argument('--generate', action='store_true')
+    parser.add_argument('--model_source', type=str, default=SELF_RAG_REPO)
+    parser.add_argument('--chosen_task', type=str, default='QA,Data2txt,Summary')
     parser.add_argument('--max_samples', type=int, default=1000)
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--max_tokens', type=int, default=512)
     parser.add_argument('--bert_model', type=str, default='roberta-large')
     args = parser.parse_args()
 
-    # Load or generate data
-    data: List[Dict[str,Any]] = []
+    chosen_task = args.chosen_task.split(',')
     
+    # Load or generate data
+    data = []
     if args.generate:
         from datasets import load_dataset
         ds = load_dataset("leobianco/ragtruth_final_test_set", split="test")
-        total = len(ds)
-        use_n = min(total, args.max_samples) if args.max_samples and args.max_samples > 0 else total
-        if use_n < total:
-            ds = ds.select(range(use_n))
-        print(f"[main] Generating predictions with Self-RAG for {len(ds)} examples...")
-        data = generate_predictions_on_dataset(ds, batch_size=args.batch_size, max_tokens=args.max_tokens, model_source=args.model_source)
+        if args.max_samples > 0:
+            ds = ds.select(range(min(len(ds), args.max_samples)))
+        print(f"Generating predictions for {len(ds)} examples...")
+        data = generate_predictions_on_dataset(ds, args.batch_size, args.max_tokens, args.model_source)
         
-        # Save predictions
-        out_file = args.filepath if args.filepath else "ragtruth_preds_selfrag.jsonl"
-        with open(out_file, "w", encoding="utf-8") as fout:
+        out_file = args.filepath or "ragtruth_preds_selfrag.jsonl"
+        with open(out_file, "w") as fout:
             for rec in data:
                 fout.write(json.dumps(rec, ensure_ascii=False) + "\n")
-        print(f"[main] Wrote generated predictions to {out_file}")
+        print(f"Saved predictions to {out_file}")
     else:
-        if not args.filepath:
-            print("Either pass --filepath <preds.jsonl> or --generate to create predictions.")
+        if not args.filepath or not os.path.exists(args.filepath):
+            print("Provide --filepath or use --generate")
             sys.exit(1)
-        if not os.path.exists(args.filepath):
-            print(f"Predictions file not found: {args.filepath}")
-            sys.exit(1)
-        print(f"[main] Loading predictions from {args.filepath}...")
-        data = load_predictions_from_jsonl(args.filepath)
-
-    # Collect texts for evaluation
-    all_pred_texts = []
-    all_gold_texts = []
+        print(f"Loading predictions from {args.filepath}...")
+        with open(args.filepath, "r") as f:
+            for line in f:
+                data.append(json.loads(line.strip()))
     
-    # Traditional metrics
-    total_f1 = 0.0
-    total_em = 0.0
+    # Detect evaluation mode
+    sample_outputs = [d.get('output', '') for d in data[:10]]
+    task_types = [detect_task_type(o) for o in sample_outputs]
+    is_text_gen = task_types.count('text_generation') > task_types.count('hallucination_detection')
     
-    # Balanced metrics
-    balanced_f1_sum = 0.0
-    balanced_prec_sum = 0.0
-    balanced_rec_sum = 0.0
-    balanced_em_sum = 0.0
+    if is_text_gen:
+        print("\n=== TEXT GENERATION MODE DETECTED ===")
+        print("Evaluating Self-RAG text generation quality\n")
+    else:
+        print("\n=== HALLUCINATION DETECTION MODE ===")
+        print("Evaluating span-level hallucination detection\n")
     
-    count = 0
+    # Initialize counters
+    task_list = chosen_task + ['All']
+    record = collections.defaultdict(int)
     
-    print(f"\n[main] Evaluating {len(data)} predictions...")
+    # For text generation metrics
+    text_metrics = {
+        'f1': collections.defaultdict(float),
+        'em': collections.defaultdict(float),
+        'balanced_f1': collections.defaultdict(float),
+        'balanced_prec': collections.defaultdict(float),
+        'balanced_rec': collections.defaultdict(float),
+        'balanced_em': collections.defaultdict(float),
+        'count': collections.defaultdict(int)
+    }
     
+    # For BERTScore
+    all_preds = []
+    all_golds = []
+    
+    # Process each example
     for i, sample in enumerate(data):
-        # For text generation: compare generated output with reference response
-        pred_text = str(sample.get('output', "")).strip()
-        gold_text = str(sample.get('response', "")).strip()
+        response = sample.get('response', '')
+        labels = sample.get('labels', [])
+        output = sample.get('output', '')
+        task = sample.get('task_type', sample.get('task', ''))
         
-        if not pred_text:
-            pred_text = ""
-        if not gold_text:
-            gold_text = ""
-        
-        all_pred_texts.append(pred_text)
-        all_gold_texts.append(gold_text)
-        
-        # Traditional F1 and EM
-        if pred_text and gold_text:
-            f1 = f1_score(pred_text, gold_text)
-            em = exact_match_score(pred_text, gold_text)
-            total_f1 += f1
-            total_em += em
+        if is_text_gen:
+            # Text generation evaluation
+            pred_text = str(output).strip()
+            gold_text = str(response).strip()
             
-            # Balanced metrics
-            b_f1, b_prec, b_rec = balanced_f1(pred_text, gold_text)
-            b_em = balanced_em(pred_text, gold_text)
+            # Show first few examples for debugging
+            if i < 3:
+                print(f"\nExample {i+1}:")
+                print(f"Predicted: {pred_text[:150]}..." if len(pred_text) > 150 else f"Predicted: {pred_text}")
+                print(f"Reference: {gold_text[:150]}..." if len(gold_text) > 150 else f"Reference: {gold_text}")
             
-            balanced_f1_sum += b_f1
-            balanced_prec_sum += b_prec
-            balanced_rec_sum += b_rec
-            balanced_em_sum += b_em
-        
-        count += 1
-        
-        # Debug first few examples
-        if i < 3:
-            print(f"\nExample {i}:")
-            print(f"  Pred: {pred_text[:100]}...")
-            print(f"  Gold: {gold_text[:100]}...")
-            print(f"  F1: {f1:.3f}, EM: {em:.3f}")
+            if pred_text and gold_text:
+                # Traditional metrics
+                f1 = f1_score(pred_text, gold_text)
+                em = exact_match_score(pred_text, gold_text)
+                
+                # Balanced metrics
+                b_f1, b_prec, b_rec = balanced_f1(pred_text, gold_text)
+                b_em = balanced_em(pred_text, gold_text)
+                
+                # Show scores for first example
+                if i == 0:
+                    print(f"  Traditional F1: {f1:.3f}, EM: {em:.3f}")
+                    print(f"  Balanced F1: {b_f1:.3f}, Prec: {b_prec:.3f}, Rec: {b_rec:.3f}, EM: {b_em:.3f}")
+                
+                for task_cur in task_list:
+                    if task_cur == task or task_cur == 'All':
+                        text_metrics['f1'][task_cur] += f1
+                        text_metrics['em'][task_cur] += em
+                        text_metrics['balanced_f1'][task_cur] += b_f1
+                        text_metrics['balanced_prec'][task_cur] += b_prec
+                        text_metrics['balanced_rec'][task_cur] += b_rec
+                        text_metrics['balanced_em'][task_cur] += b_em
+                        text_metrics['count'][task_cur] += 1
+            
+            all_preds.append(pred_text if pred_text else "no response")
+            all_golds.append(gold_text if gold_text else "no reference")
+            
+        else:
+            # Hallucination detection evaluation (span-level)
+            res = cal_span_metrics(response, labels, output)
+            temp_tp, temp_pred_len, temp_gold_len, pos_true, neg_true, neg_false, pos_false = res
+            
+            for task_cur in task_list:
+                if task_cur == task or task_cur == 'All':
+                    record['match_size_'+task_cur] += temp_tp
+                    record['prediction_'+task_cur] += temp_pred_len
+                    record['ground_truth_'+task_cur] += temp_gold_len
+                    record['pos_true_cnt_'+task_cur] += pos_true
+                    record['neg_true_cnt_'+task_cur] += neg_true
+                    record['neg_false_cnt_'+task_cur] += neg_false
+                    record['pos_false_cnt_'+task_cur] += pos_false
     
-    # Calculate averages
-    avg_f1 = total_f1 / count if count > 0 else 0.0
-    avg_em = total_em / count if count > 0 else 0.0
-    balanced_f1_avg = balanced_f1_sum / count if count > 0 else 0.0
-    balanced_prec_avg = balanced_prec_sum / count if count > 0 else 0.0
-    balanced_rec_avg = balanced_rec_sum / count if count > 0 else 0.0
-    balanced_em_avg = balanced_em_sum / count if count > 0 else 0.0
-    
-    # Compute BERTScore
-    print("\nComputing BERTScore (this may take a while)...")
-    try:
-        # Filter out empty pairs for BERTScore
-        valid_pairs = [(p, g) for p, g in zip(all_pred_texts, all_gold_texts) if p and g]
-        if valid_pairs:
-            valid_preds = [p for p, g in valid_pairs]
-            valid_golds = [g for p, g in valid_pairs]
-            
+    # Print results
+    if is_text_gen:
+        # Text generation results
+        print("\n" + "="*60)
+        print("TEXT GENERATION EVALUATION RESULTS")
+        print("="*60)
+        
+        for task_cur in task_list:
+            if text_metrics['count'][task_cur] > 0:
+                count = text_metrics['count'][task_cur]
+                print(f"\nTask: {task_cur} ({count} examples)")
+                print(f"Traditional F1: {text_metrics['f1'][task_cur]/count:.4f}")
+                print(f"Traditional EM: {text_metrics['em'][task_cur]/count:.4f}")
+                print(f"Balanced F1: {text_metrics['balanced_f1'][task_cur]/count:.4f}")
+                print(f"Balanced Precision: {text_metrics['balanced_prec'][task_cur]/count:.4f}")
+                print(f"Balanced Recall: {text_metrics['balanced_rec'][task_cur]/count:.4f}")
+                print(f"Balanced EM: {text_metrics['balanced_em'][task_cur]/count:.4f}")
+        
+        # Compute BERTScore
+        print("\nComputing BERTScore...")
+        try:
             P, R, F1 = bert_score(
-                valid_preds, 
-                valid_golds, 
-                model_type=args.bert_model, 
-                lang='en', 
-                rescale_with_baseline=False, 
+                all_preds,
+                all_golds,
+                model_type=args.bert_model,
+                lang='en',
+                rescale_with_baseline=True,  # Use rescaling for more interpretable scores
                 verbose=False
             )
-            bert_p = float(P.mean())
-            bert_r = float(R.mean())
-            bert_f1 = float(F1.mean())
-        else:
-            bert_p = bert_r = bert_f1 = 0.0
-    except Exception as e:
-        print(f"[warning] BERTScore failed: {e}")
-        bert_p = bert_r = bert_f1 = 0.0
-
-    # Summarize results
-    results = {
-        "num_samples": count,
-        "traditional_f1": avg_f1,
-        "traditional_em": avg_em,
-        "balanced_f1": balanced_f1_avg,
-        "balanced_precision": balanced_prec_avg,
-        "balanced_recall": balanced_rec_avg,
-        "balanced_em": balanced_em_avg,
-        "bertscore_precision": bert_p,
-        "bertscore_recall": bert_r,
-        "bertscore_f1": bert_f1,
-        "bertscore_model": args.bert_model,
-    }
-
-    print("\n" + "="*60)
-    print("SELF-RAG TEXT GENERATION EVALUATION RESULTS")
+            print(f"\nBERTScore (with {args.bert_model}):")
+            print(f"Precision: {float(P.mean()):.4f}")
+            print(f"Recall: {float(R.mean()):.4f}")
+            print(f"F1: {float(F1.mean()):.4f}")
+        except Exception as e:
+            print(f"BERTScore failed: {e}")
+        
+    else:
+        # Hallucination detection results
+        print("\n" + "="*60)
+        print("HALLUCINATION DETECTION RESULTS")
+        print("="*60)
+        
+        for task_cur in task_list:
+            if record['ground_truth_'+task_cur] > 0 or record['prediction_'+task_cur] > 0:
+                print(f"\nTask: {task_cur}")
+                
+                # Span-level metrics
+                rec = record['match_size_'+task_cur] / record['ground_truth_'+task_cur] if record['ground_truth_'+task_cur] else 0
+                prec = record['match_size_'+task_cur] / record['prediction_'+task_cur] if record['prediction_'+task_cur] else 0
+                f1 = 2 * rec * prec / (rec + prec) if (rec + prec) > 0 else 0
+                print(f"Span-level - Precision: {prec:.4f}, Recall: {rec:.4f}, F1: {f1:.4f}")
+                
+                # Case-level metrics
+                total_pos = record['pos_true_cnt_'+task_cur] + record['pos_false_cnt_'+task_cur]
+                total_with_labels = record['pos_true_cnt_'+task_cur] + record['neg_true_cnt_'+task_cur]
+                case_prec = record['pos_true_cnt_'+task_cur] / total_pos if total_pos else 0
+                case_rec = record['pos_true_cnt_'+task_cur] / total_with_labels if total_with_labels else 0
+                case_f1 = 2 * case_prec * case_rec / (case_prec + case_rec) if (case_prec + case_rec) > 0 else 0
+                print(f"Case-level - Precision: {case_prec:.4f}, Recall: {case_rec:.4f}, F1: {case_f1:.4f}")
+    
     print("="*60)
-    print(f"Num samples: {results['num_samples']}")
-    print(f"Traditional F1: {results['traditional_f1']:.4f}")
-    print(f"Traditional EM: {results['traditional_em']:.4f}")
-    print(f"Balanced F1: {results['balanced_f1']:.4f}")
-    print(f"Balanced Precision: {results['balanced_precision']:.4f}")
-    print(f"Balanced Recall: {results['balanced_recall']:.4f}")
-    print(f"Balanced EM: {results['balanced_em']:.4f}")
-    print(f"BERTScore Precision: {results['bertscore_precision']:.4f}")
-    print(f"BERTScore Recall: {results['bertscore_recall']:.4f}")
-    print(f"BERTScore F1: {results['bertscore_f1']:.4f}")
-    print("="*60)
-
-    # Write summary JSON
-    summary_file = args.filepath.replace(".jsonl", "_summary.json") if args.filepath and args.filepath.endswith(".jsonl") else "summary.json"
-    with open(summary_file, "w", encoding="utf-8") as sf:
-        json.dump(results, sf, indent=2)
-    print(f"\nSummary written to {summary_file}")
+    print(f"\nTotal examples evaluated: {len(data)}")
 
 if __name__ == '__main__':
     main()
